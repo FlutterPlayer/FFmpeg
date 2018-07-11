@@ -3338,6 +3338,8 @@ static void mov_estimate_video_delay(MOVContext *c, AVStream* st) {
                 if (pts_buf[j] < pts_buf[r]) {
                     FFSWAP(int64_t, pts_buf[j], pts_buf[r]);
                     ++num_swaps;
+                } else {
+                    break;
                 }
                 j = r;
             }
