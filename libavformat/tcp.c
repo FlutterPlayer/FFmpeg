@@ -47,21 +47,9 @@ typedef struct TCPContext {
     int recv_buffer_size;
     int send_buffer_size;
     int tcp_nodelay;
-    char * app_ctx_intptr;
-
-    int addrinfo_one_by_one;
-    int addrinfo_timeout;
-    int64_t dns_cache_timeout;
-    int dns_cache_clear;
-
-    AVApplicationContext *app_ctx;
-    char uri[1024];
-    int fastopen;
-    int tcp_connected;
-    int fastopen_success;
-    int dash_audio_tcp;
-    int dash_video_tcp;
-    int enable_ipv6;
+#if !HAVE_WINSOCK2_H
+    int tcp_mss;
+#endif /* !HAVE_WINSOCK2_H */
 } TCPContext;
 
 #define FAST_OPEN_FLAG 0x20000000
@@ -97,253 +85,34 @@ static const AVClass tcp_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-int ijk_tcp_getaddrinfo_nonblock(const char *hostname, const char *servname,
-                                 const struct addrinfo *hints, struct addrinfo **res,
-                                 int64_t timeout,
-                                 const AVIOInterruptCB *int_cb, int one_by_one);
-#ifdef HAVE_PTHREADS
-
-typedef struct TCPAddrinfoRequest
+static void customize_fd(void *ctx, int fd)
 {
-    AVBufferRef *buffer;
-
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-
-    AVIOInterruptCB interrupt_callback;
-
-    char            *hostname;
-    char            *servname;
-    struct addrinfo  hints;
-    struct addrinfo *res;
-
-    volatile int     finished;
-    int              last_error;
-} TCPAddrinfoRequest;
-
-static void tcp_getaddrinfo_request_free(TCPAddrinfoRequest *req)
-{
-    av_assert0(req);
-    if (req->res) {
-        freeaddrinfo(req->res);
-        req->res = NULL;
-    }
-
-    av_freep(&req->servname);
-    av_freep(&req->hostname);
-    pthread_cond_destroy(&req->cond);
-    pthread_mutex_destroy(&req->mutex);
-    av_freep(&req);
-}
-
-static void tcp_getaddrinfo_request_free_buffer(void *opaque, uint8_t *data)
-{
-    av_assert0(opaque);
-    TCPAddrinfoRequest *req = (TCPAddrinfoRequest *)opaque;
-    tcp_getaddrinfo_request_free(req);
-}
-
-static int tcp_getaddrinfo_request_create(TCPAddrinfoRequest **request,
-                                          const char *hostname,
-                                          const char *servname,
-                                          const struct addrinfo *hints,
-                                          const AVIOInterruptCB *int_cb)
-{
-    TCPAddrinfoRequest *req = (TCPAddrinfoRequest *) av_mallocz(sizeof(TCPAddrinfoRequest));
-    if (!req)
-        return AVERROR(ENOMEM);
-
-    if (pthread_mutex_init(&req->mutex, NULL)) {
-        av_freep(&req);
-        return AVERROR(ENOMEM);
-    }
-
-    if (pthread_cond_init(&req->cond, NULL)) {
-        pthread_mutex_destroy(&req->mutex);
-        av_freep(&req);
-        return AVERROR(ENOMEM);
-    }
-
-    if (int_cb)
-        req->interrupt_callback = *int_cb;
-
-    if (hostname) {
-        req->hostname = av_strdup(hostname);
-        if (!req->hostname)
-            goto fail;
-    }
-
-    if (servname) {
-        req->servname = av_strdup(servname);
-        if (!req->hostname)
-            goto fail;
-    }
-
-    if (hints) {
-        req->hints.ai_family   = hints->ai_family;
-        req->hints.ai_socktype = hints->ai_socktype;
-        req->hints.ai_protocol = hints->ai_protocol;
-        req->hints.ai_flags    = hints->ai_flags;
-    }
-
-    req->buffer = av_buffer_create(NULL, 0, tcp_getaddrinfo_request_free_buffer, req, 0);
-    if (!req->buffer)
-        goto fail;
-
-    *request = req;
-    return 0;
-fail:
-    tcp_getaddrinfo_request_free(req);
-    return AVERROR(ENOMEM);
-}
-
-static void *tcp_getaddrinfo_worker(void *arg)
-{
-    TCPAddrinfoRequest *req = arg;
-
-    getaddrinfo(req->hostname, req->servname, &req->hints, &req->res);
-    pthread_mutex_lock(&req->mutex);
-    req->finished = 1;
-    pthread_cond_signal(&req->cond);
-    pthread_mutex_unlock(&req->mutex);
-    av_buffer_unref(&req->buffer);
-    return NULL;
-}
-
-static void *tcp_getaddrinfo_one_by_one_worker(void *arg)
-{
-    struct addrinfo *temp_addrinfo = NULL;
-    struct addrinfo *cur = NULL;
-    int ret = EAI_FAIL;
-    int i = 0;
-    int option_length = 0;
-
-    TCPAddrinfoRequest *req = (TCPAddrinfoRequest *)arg;
-
-    int family_option[2] = {AF_INET, AF_INET6};
-
-    option_length = sizeof(family_option) / sizeof(family_option[0]);
-
-    for (; i < option_length; ++i) {
-        struct addrinfo *hint = &req->hints;
-        hint->ai_family = family_option[i];
-        ret = getaddrinfo(req->hostname, req->servname, hint, &temp_addrinfo);
-        if (ret) {
-            req->last_error = ret;
-            continue;
+    TCPContext *s = ctx;
+    /* Set the socket's send or receive buffer sizes, if specified.
+       If unspecified or setting fails, system default is used. */
+    if (s->recv_buffer_size > 0) {
+        if (setsockopt (fd, SOL_SOCKET, SO_RCVBUF, &s->recv_buffer_size, sizeof (s->recv_buffer_size))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(SO_RCVBUF)");
         }
-        pthread_mutex_lock(&req->mutex);
-        if (!req->res) {
-            req->res = temp_addrinfo;
-        } else {
-            cur = req->res;
-            while (cur->ai_next)
-                cur = cur->ai_next;
-            cur->ai_next = temp_addrinfo;
-        }
-        pthread_mutex_unlock(&req->mutex);
     }
-    pthread_mutex_lock(&req->mutex);
-    req->finished = 1;
-    pthread_cond_signal(&req->cond);
-    pthread_mutex_unlock(&req->mutex);
-    av_buffer_unref(&req->buffer);
-    return NULL;
+    if (s->send_buffer_size > 0) {
+        if (setsockopt (fd, SOL_SOCKET, SO_SNDBUF, &s->send_buffer_size, sizeof (s->send_buffer_size))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(SO_SNDBUF)");
+        }
+    }
+    if (s->tcp_nodelay > 0) {
+        if (setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &s->tcp_nodelay, sizeof (s->tcp_nodelay))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_NODELAY)");
+        }
+    }
+#if !HAVE_WINSOCK2_H
+    if (s->tcp_mss > 0) {
+        if (setsockopt (fd, IPPROTO_TCP, TCP_MAXSEG, &s->tcp_mss, sizeof (s->tcp_mss))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_MAXSEG)");
+        }
+    }
+#endif /* !HAVE_WINSOCK2_H */
 }
-
-int ijk_tcp_getaddrinfo_nonblock(const char *hostname, const char *servname,
-                                 const struct addrinfo *hints, struct addrinfo **res,
-                                 int64_t timeout,
-                                 const AVIOInterruptCB *int_cb, int one_by_one)
-{
-    int     ret;
-    int64_t start;
-    int64_t now;
-    AVBufferRef        *req_ref = NULL;
-    TCPAddrinfoRequest *req     = NULL;
-    pthread_t work_thread;
-
-    if (hostname && !hostname[0])
-        hostname = NULL;
-
-    if (timeout <= 0)
-        return getaddrinfo(hostname, servname, hints, res);
-
-    ret = tcp_getaddrinfo_request_create(&req, hostname, servname, hints, int_cb);
-    if (ret)
-        goto fail;
-
-    req_ref = av_buffer_ref(req->buffer);
-    if (req_ref == NULL) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    /* FIXME: using a thread pool would be better. */
-    if (one_by_one)
-        ret = pthread_create(&work_thread, NULL, tcp_getaddrinfo_one_by_one_worker, req);
-    else
-        ret = pthread_create(&work_thread, NULL, tcp_getaddrinfo_worker, req);
-
-    if (ret) {
-        ret = AVERROR(ret);
-        goto fail;
-    }
-
-    pthread_detach(work_thread);
-
-    start = av_gettime();
-    now   = start;
-
-    pthread_mutex_lock(&req->mutex);
-    while (1) {
-        int64_t wait_time = now + 100000;
-        struct timespec tv = { .tv_sec  =  wait_time / 1000000,
-                               .tv_nsec = (wait_time % 1000000) * 1000 };
-
-        if (req->finished || (start + timeout < now)) {
-            if (req->res) {
-                ret = 0;
-                *res = req->res;
-                req->res = NULL;
-            } else {
-                ret = req->last_error ? req->last_error : AVERROR_EXIT;
-            }
-            break;
-        }
-#if defined(__ANDROID__) && defined(HAVE_PTHREAD_COND_TIMEDWAIT_MONOTONIC)
-        ret = pthread_cond_timedwait_monotonic_np(&req->cond, &req->mutex, &tv);
-#else
-        ret = pthread_cond_timedwait(&req->cond, &req->mutex, &tv);
-#endif
-        if (ret != 0 && ret != ETIMEDOUT) {
-            av_log(NULL, AV_LOG_ERROR, "pthread_cond_timedwait failed: %d\n", ret);
-            ret = AVERROR_EXIT;
-            break;
-        }
-
-        if (ff_check_interrupt(&req->interrupt_callback)) {
-            ret = AVERROR_EXIT;
-            break;
-        }
-
-        now = av_gettime();
-    }
-    pthread_mutex_unlock(&req->mutex);
-fail:
-    av_buffer_unref(&req_ref);
-    return ret;
-}
-
-#else
-int ijk_tcp_getaddrinfo_nonblock(const char *hostname, const char *servname,
-                                 const struct addrinfo *hints, struct addrinfo **res,
-                                 int64_t timeout,
-                                 const AVIOInterruptCB *int_cb)
-{
-    return getaddrinfo(hostname, servname, hints, res);
-}
-#endif
 
 /* return non zero if error */
 static int tcp_open(URLContext *h, const char *uri, int flags)
@@ -489,7 +258,6 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
     }
 
 
- restart:
 #if HAVE_STRUCT_SOCKADDR_IN6
     // workaround for IOS9 getaddrinfo in IPv6 only network use hardcode IPv4 address can not resolve port number.
     if (cur_ai->ai_family == AF_INET6){
@@ -516,32 +284,19 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
         }
     }
 
-    fd = ff_socket(cur_ai->ai_family,
-                   cur_ai->ai_socktype,
-                   cur_ai->ai_protocol);
-    if (fd < 0) {
-        ret = ff_neterrno();
-        goto fail;
-    }
-
-    if (s->app_ctx) {
-        if (s->dash_audio_tcp && s->app_ctx->dash_audio_recv_buffer_size > 0 && s->app_ctx->dash_audio_recv_buffer_size != s->recv_buffer_size) {
-            s->recv_buffer_size = s->app_ctx->dash_audio_recv_buffer_size;
-        } else if (s->dash_video_tcp && s->app_ctx->dash_video_recv_buffer_size > 0 && s->app_ctx->dash_video_recv_buffer_size != s->recv_buffer_size) {
-            s->recv_buffer_size = s->app_ctx->dash_video_recv_buffer_size;
+    if (s->listen > 0) {
+        while (cur_ai && fd < 0) {
+            fd = ff_socket(cur_ai->ai_family,
+                           cur_ai->ai_socktype,
+                           cur_ai->ai_protocol);
+            if (fd < 0) {
+                ret = ff_neterrno();
+                cur_ai = cur_ai->ai_next;
+            }
         }
-    }
-
-    /* Set the socket's send or receive buffer sizes, if specified.
-       If unspecified or setting fails, system default is used. */
-    if (s->recv_buffer_size > 0) {
-        setsockopt (fd, SOL_SOCKET, SO_RCVBUF, &s->recv_buffer_size, sizeof (s->recv_buffer_size));
-    }
-    if (s->send_buffer_size > 0) {
-        setsockopt (fd, SOL_SOCKET, SO_SNDBUF, &s->send_buffer_size, sizeof (s->send_buffer_size));
-    }
-    if (s->tcp_nodelay > 0) {
-        setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &s->tcp_nodelay, sizeof (s->tcp_nodelay));
+        if (fd < 0)
+            goto fail1;
+        customize_fd(s, fd);
     }
 
     if (s->listen == 2) {
@@ -556,34 +311,9 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
         // Socket descriptor already closed here. Safe to overwrite to client one.
         fd = ret;
     } else {
-        ret = av_application_on_tcp_will_open(s->app_ctx, cur_ai->ai_family);
-        if (ret) {
-            av_log(NULL, AV_LOG_WARNING, "terminated by application in AVAPP_CTRL_WILL_TCP_OPEN");
+        ret = ff_connect_parallel(ai, s->open_timeout / 1000, 3, h, &fd, customize_fd, s);
+        if (ret < 0)
             goto fail1;
-        }
-        tcp_time = av_gettime();
-        if ((ret = ff_listen_connect(fd, cur_ai->ai_addr, cur_ai->ai_addrlen,
-                                     s->open_timeout / 1000, h, !!cur_ai->ai_next)) < 0) {
-            if (ret == AVERROR(ETIMEDOUT)) {
-                ret = AVERROR_TCP_CONNECT_TIMEOUT;
-            }
-            if (av_application_on_tcp_did_open(s->app_ctx, ret, fd, &control, s->dash_audio_tcp, cur_ai->ai_family, (av_gettime() - tcp_time) / 1000))
-                goto fail1;
-            if (ret == AVERROR_EXIT)
-                goto fail1;
-            else
-                goto fail;
-        } else {
-            ret = av_application_on_tcp_did_open(s->app_ctx, 0, fd, &control, s->dash_audio_tcp, cur_ai->ai_family, (av_gettime() - tcp_time) / 1000);
-            if (ret) {
-                av_log(NULL, AV_LOG_WARNING, "terminated by application in AVAPP_CTRL_DID_TCP_OPEN");
-                goto fail1;
-            } else if (!dns_entry && !strstr(uri, control.ip) && s->dns_cache_timeout > 0) {
-                add_dns_cache_entry(uri, cur_ai, s->dns_cache_timeout);
-                av_log(NULL, AV_LOG_INFO, "add dns cache uri = %s, ip = %s port = %d\n", uri , control.ip, control.port);
-            }
-            av_log(NULL, AV_LOG_INFO, "tcp did open uri = %s, ip = %s port = %d\n", uri , control.ip, control.port);
-        }
     }
 
     h->is_streamed = 1;
@@ -596,15 +326,6 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
     }
     return 0;
 
- fail:
-    if (cur_ai->ai_next) {
-        /* Retry with the next sockaddr */
-        cur_ai = cur_ai->ai_next;
-        if (fd >= 0)
-            closesocket(fd);
-        ret = 0;
-        goto restart;
-    }
  fail1:
     if (fd >= 0)
         closesocket(fd);
@@ -819,8 +540,10 @@ static int tcp_accept(URLContext *s, URLContext **c)
         return ret;
     cc = (*c)->priv_data;
     ret = ff_accept(sc->fd, sc->listen_timeout, s);
-    if (ret < 0)
+    if (ret < 0) {
+        ffurl_closep(c);
         return ret;
+    }
     cc->fd = ret;
     return 0;
 }
