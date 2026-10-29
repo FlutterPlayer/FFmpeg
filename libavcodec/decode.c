@@ -249,8 +249,9 @@ int ff_decode_get_packet(AVCodecContext *avctx, AVPacket *pkt)
 {
     AVCodecInternal *avci = avctx->internal;
     DecodeContext     *dc = decode_ctx(avci);
+    int drain_silence_enable = (avctx->flags2 & AV_CODEC_FLAG2_DRAIN_SILENCE) == AV_CODEC_FLAG2_DRAIN_SILENCE;
 
-    if (avci->draining)
+    if (avci->draining && (!drain_silence_enable || !avci->drain_silence))
         return AVERROR_EOF;
 
     /* If we are a worker thread, get the next packet from the threading
@@ -271,8 +272,9 @@ int ff_decode_get_packet(AVCodecContext *avctx, AVPacket *pkt)
             av_packet_unref(avci->buffer_pkt);
         }
 
-        if (ret == AVERROR_EOF)
+        if (ret == AVERROR_EOF && (!drain_silence_enable || !avci->drain_silence)) {
             avci->draining = 1;
+        }
         return ret;
     }
 }
@@ -411,6 +413,17 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
  * returning any output, so this function needs to be called in a loop until it
  * returns EAGAIN.
  **/
+static int fill_silence_frame(AVCodecContext *avctx, AVFrame *frame, int samples, int pts) {
+    int ret = 0;
+    frame->best_effort_timestamp = pts;
+    frame->nb_samples = samples;
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
+        return ret;
+    ret = av_samples_set_silence(frame->extended_data, 0, samples,
+                               avctx->ch_layout.nb_channels, avctx->sample_fmt);
+    return ret;
+}
+
 static inline int decode_simple_internal(AVCodecContext *avctx, AVFrame *frame, int64_t *discarded_samples)
 {
     AVCodecInternal   *avci = avctx->internal;
@@ -418,13 +431,56 @@ static inline int decode_simple_internal(AVCodecContext *avctx, AVFrame *frame, 
     AVPacket     *const pkt = avci->in_pkt;
     const FFCodec *const codec = ffcodec(avctx->codec);
     int got_frame, consumed;
-    int ret;
+    int ret = 0;
 
-    if (!pkt->data && !avci->draining) {
+    int drain_silence_enable = (avctx->flags2 & AV_CODEC_FLAG2_DRAIN_SILENCE) == AV_CODEC_FLAG2_DRAIN_SILENCE;
+    int need_get_packet = 0;
+    if (drain_silence_enable) {
+        need_get_packet = !pkt->data && !pkt->side_data_elems && (!avci->draining || (avci->draining_done && avci->drain_silence));
+    } else {
+        need_get_packet = !pkt->data && !avci->draining;
+    }
+    if (need_get_packet) {
         av_packet_unref(pkt);
         ret = ff_decode_get_packet(avctx, pkt);
         if (ret < 0 && ret != AVERROR_EOF)
             return ret;
+    }
+
+    int silence = 0;
+    if (drain_silence_enable && avctx->codec->type == AVMEDIA_TYPE_AUDIO) {
+        if (avci->drain_silence && avci->draining_done && ret == AVERROR_EOF) {
+            avci->drain_silence = 0;
+            return ret;
+        }
+
+        AVDictionary ** dict = (AVDictionary **)av_packet_get_side_data(pkt, AV_PKT_DATA_DICT, NULL);
+        if (dict && *dict) {
+            AVDictionaryEntry * t = NULL;
+            t = av_dict_get(*dict, "silence", NULL, AV_DICT_MATCH_CASE);
+            if (t) {
+                silence = atoi(t->value);
+            }
+        }
+        if (silence) {
+            if (!avci->drain_silence) {
+                avci->drain_silence = silence;
+                avci->drain_silence_pts = guess_correct_pts(dc, pkt->pts, pkt->dts);
+                avci->draining = 1;
+                if (!(avctx->codec->capabilities & AV_CODEC_CAP_DELAY ||
+                      avctx->active_thread_type & FF_THREAD_FRAME)) {
+                    avci->draining_done = 1;
+                }
+            }
+
+            if (avci->draining_done) {
+                int64_t pts = guess_correct_pts(dc, pkt->pts, pkt->dts);
+                av_packet_unref(pkt);
+                fill_silence_frame(avctx, frame, silence, pts);
+                return 0;
+            }
+            av_packet_unref(pkt);
+        }
     }
 
     // Some codecs (at least wma lossless) will crash when feeding drain packets
@@ -708,13 +764,15 @@ int attribute_align_arg avcodec_send_packet(AVCodecContext *avctx, const AVPacke
     DecodeContext     *dc = decode_ctx(avci);
     int ret;
 
+    int drain_silence_enable = (avctx->flags2 & AV_CODEC_FLAG2_DRAIN_SILENCE) == AV_CODEC_FLAG2_DRAIN_SILENCE;
+
     if (!avcodec_is_open(avctx) || !av_codec_is_decoder(avctx->codec))
         return AVERROR(EINVAL);
 
-    if (dc->draining_started)
+    if (dc->draining_started && (!drain_silence_enable || !avci->drain_silence))
         return AVERROR_EOF;
 
-    if (avpkt && !avpkt->size && avpkt->data)
+    if (avpkt && !avpkt->size && avpkt->data && (!drain_silence_enable || !avpkt->side_data_elems))
         return AVERROR(EINVAL);
 
     if (avpkt && (avpkt->data || avpkt->side_data_elems)) {

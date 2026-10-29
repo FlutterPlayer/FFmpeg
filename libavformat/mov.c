@@ -2469,8 +2469,14 @@ static int mov_read_glbl(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         if (type == MKTAG('f','i','e','l') && size == atom.size)
             return mov_read_default(c, pb, atom);
     }
+    c->has_extradata = 1;
     if (st->codecpar->extradata_size > 1 && st->codecpar->extradata) {
-        av_log(c->fc, AV_LOG_WARNING, "ignoring multiple glbl\n");
+        if (c->allow_multi_extradata) {
+            av_log(c->fc, AV_LOG_WARNING, "found multiple glbl\n");
+        } else {
+            av_log(c->fc, AV_LOG_WARNING, "ignoring multiple glbl\n");
+            return 0;
+        }
         return 0;
     }
     ret = ff_get_extradata(c->fc, st->codecpar, pb, atom.size);
@@ -5990,6 +5996,11 @@ static int mov_read_trun(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         if (prev_dts >= dts)
             index_entry_flags |= AVINDEX_DISCARD_FRAME;
 
+        if (i == 0) {
+            index_entry_flags |= AVINDEX_SAP;
+        }
+
+        sti->index_entries[index_entry_pos].sap = next_frag_index;
         sti->index_entries[index_entry_pos].pos   = offset;
         sti->index_entries[index_entry_pos].timestamp = dts;
         sti->index_entries[index_entry_pos].size  = sample_size;
@@ -6132,6 +6143,8 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     avio_rb16(pb); // reserved
 
     item_count = avio_rb16(pb);
+    av_dict_set_int(&c->fc->metadata, "segment_count", (int)item_count, 0);
+    av_log(NULL, AV_LOG_INFO, "read sidx count = %d\n", (int)item_count);
     if (item_count == 0)
         return AVERROR_INVALIDDATA;
 
@@ -6160,7 +6173,7 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         pts += duration;
     }
 
-    st->duration = sc->track_end = pts;
+    st->duration = sc->track_end = sc->last_pts = pts;
 
     sc->has_sidx = 1;
 
@@ -11123,6 +11136,9 @@ static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *s
     if (sample->flags & AVINDEX_DISCARD_FRAME) {
         pkt->flags |= AV_PKT_FLAG_DISCARD;
     }
+    if (sample->flags & AVINDEX_SAP) {
+        pkt->flags |= AV_PKT_FLAG_SAP;
+    }
     if (sc->stts_count && sc->tts_index < sc->tts_count)
         pkt->duration = sc->tts_data[sc->tts_index].duration;
     if (sc->ctts_count && sc->tts_index < sc->tts_count) {
@@ -11352,6 +11368,30 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
         return ret;
     }
 
+    pkt->current_sap = AV_NOPTS_VALUE;
+    pkt->next_sap    = AV_NOPTS_VALUE;
+    if (mov && sc->has_sidx) {
+        int64_t timestamp = AV_NOPTS_VALUE;
+        if (mov->ignore_sidx_index) {
+            if (pkt->pts != AV_NOPTS_VALUE) {
+                timestamp = pkt->pts;
+            } else {
+                timestamp = pkt->dts;
+            }
+        } else {
+            timestamp = pkt->dts + sc->time_offset;
+        }
+        int64_t search_index = search_frag_timestamp(s, &mov->frag_index, st, timestamp);
+        if (search_index >= 0 && search_index < mov->frag_index.nb_items) {
+            pkt->current_sap = search_index;
+            if (search_index + 1 < mov->frag_index.nb_items) {
+                pkt->next_sap = search_index + 1;
+            }
+        } else {
+            av_log(NULL, AV_LOG_ERROR, "search_frag_timestamp fail! stream %d pkt->dts = %"PRId64"\n", st->index, pkt->dts);
+        }
+    }
+    pkt->codec_id     = st->codecpar->codec_id;
     return 0;
 }
 
@@ -11418,20 +11458,92 @@ static int can_seek_to_key_sample(AVStream *st, int sample, int64_t requested_pt
     return 1;
 }
 
+extern int mov_frag_get_frag_index_with_timestamp(AVFormatContext *s, int64_t timestamp);
+extern int64_t mov_frag_get_timestamp_with_index(AVFormatContext *s, int index);
+extern int64_t mov_frag_get_last_pts(AVFormatContext *s);
+
+int mov_frag_get_frag_index_with_timestamp(AVFormatContext *s, int64_t timestamp){
+    if (!s->streams) {
+        av_log(NULL, AV_LOG_ERROR, "mov_frag_get_frag_index_with_timestamp s->streams is NULL\n");
+    }
+    AVStream *st    = s->streams[0];
+    MOVContext *mov = s->priv_data;
+    MOVStreamContext *sc =  st->priv_data;
+    int ts = av_rescale_q(timestamp, AV_TIME_BASE_Q, st->time_base);
+    return search_frag_timestamp(s, &mov->frag_index, st, ts + sc->time_offset);
+}
+
+int64_t mov_frag_get_timestamp_with_index(AVFormatContext *s, int index){
+    if (!s->streams) {
+        av_log(NULL, AV_LOG_ERROR, "mov_frag_get_timestamp_with_index s->streams is NULL\n");
+    }
+    AVStream *st    = s->streams[0];
+    MOVContext *mov = s->priv_data;
+    if (index < 0)
+        index = 0;
+    if (index >= mov->frag_index.nb_items)
+        index = mov->frag_index.nb_items - 1;
+    int64_t timestamp = get_frag_time(s, st, &mov->frag_index, index);
+    if (timestamp == AV_NOPTS_VALUE)
+        return timestamp;
+    return av_rescale_q(timestamp, st->time_base, AV_TIME_BASE_Q);
+}
+
+int64_t mov_frag_get_last_pts(AVFormatContext *s) {
+    if (!s->streams) {
+        av_log(NULL, AV_LOG_ERROR, "mov_frag_get_last_pts s->streams is NULL\n");
+    }
+    AVStream *st    = s->streams[0];
+    MOVStreamContext *sc = st->priv_data;
+    int64_t timestamp = sc->last_pts;
+    if (timestamp == AV_NOPTS_VALUE)
+        return timestamp;
+    return av_rescale_q(timestamp, st->time_base, AV_TIME_BASE_Q);
+}
+
+static int mov_seek_sap(AVFormatContext *s, AVStream *st, int index)
+{
+    MOVContext *mov = s->priv_data;
+
+    if (!mov->frag_index.complete)
+        return 0;
+
+    if (index < 0)
+        index = 0;
+    if (index >= mov->frag_index.nb_items)
+        index = mov->frag_index.nb_items - 1;
+    if (!mov->frag_index.item[index].headers_read)
+        return mov_switch_root(s, -1, index);
+    if (index + 1 < mov->frag_index.nb_items)
+        mov->next_root_atom = mov->frag_index.item[index + 1].moof_offset;
+    else if (mov->fix_fragment_seek)
+        mov->next_root_atom = 0;
+    return 0;
+}
+
 static int mov_seek_stream(AVFormatContext *s, AVStream *st, int64_t timestamp, int flags)
 {
+    MOVContext *mov = s->priv_data;
     MOVStreamContext *sc = st->priv_data;
     FFStream *const sti = ffstream(st);
     int sample, time_sample, ret, next_ts, requested_sample;
     unsigned int i;
 
-    // Here we consider timestamp to be PTS, hence try to offset it so that we
-    // can search over the DTS timeline.
-    timestamp -= (sc->min_corrected_pts + sc->dts_shift);
+    if ((flags & AVSEEK_FLAG_SAP) == AVSEEK_FLAG_SAP) {
+        ret = mov_seek_sap(s, st, timestamp);
+        if (ret < 0)
+            return ret;
+        timestamp = get_frag_time(s, st, &mov->frag_index, (int)timestamp);
+        flags &= ~AVSEEK_FLAG_SAP;
+    } else {
+        // Here we consider timestamp to be PTS, hence  try to offset it so that we
+        // can search over the DTS timeline.
+        timestamp -= (sc->min_corrected_pts + sc->dts_shift);
 
-    ret = mov_seek_fragment(s, st, timestamp);
-    if (ret < 0)
-        return ret;
+        ret = mov_seek_fragment(s, st, timestamp);
+        if (ret < 0)
+            return ret;
+    }
 
     for (;;) {
         sample = av_index_search_timestamp(st, timestamp, flags);
@@ -11522,6 +11634,15 @@ static int mov_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
 
     st = s->streams[stream_index];
     sti = ffstream(st);
+
+    if ((flags & AVSEEK_FLAG_SAP) == AVSEEK_FLAG_SAP) {
+        if (mc && sample_time >= mc->frag_index.nb_items) {
+            sample_time = mc->frag_index.nb_items - 1;
+        }
+        if (sample_time < 0) {
+            sample_time = 0;
+        }
+    }
     sample = mov_seek_stream(s, st, sample_time, flags);
     if (sample < 0)
         return sample;
@@ -11561,6 +11682,10 @@ static int mov_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
                 break;
             mov_current_sample_inc(sc);
         }
+    }
+    {
+        MOVStreamContext *sc = st->priv_data;
+        st->seek_result = ffstream(st)->index_entries[sc->current_sample].timestamp + sc->time_offset;
     }
     return 0;
 }
@@ -11617,6 +11742,14 @@ static const AVOption mov_options[] = {
     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "interleaved_read", "Interleave packets from multiple tracks at demuxer level", OFFSET(interleaved_read), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, .flags = AV_OPT_FLAG_DECODING_PARAM },
 
+    {"allow_multi_extradata", "", OFFSET(allow_multi_extradata), AV_OPT_TYPE_BOOL, {.i64 = 0},
+        0, 1, FLAGS},
+
+    {"ignore_sidx_index", "ignore sidx when build index", OFFSET(ignore_sidx_index), AV_OPT_TYPE_BOOL, {.i64 = 1},
+        0, 1, FLAGS},
+
+    {"fix_fragment_seek", "fix fragment seek problem", OFFSET(fix_fragment_seek), AV_OPT_TYPE_BOOL, {.i64 = 1},
+        0, 1, FLAGS},
     { NULL },
 };
 

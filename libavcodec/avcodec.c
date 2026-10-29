@@ -380,6 +380,8 @@ void avcodec_flush_buffers(AVCodecContext *avctx)
 {
     AVCodecInternal *avci = avctx->internal;
 
+    avci->drain_silence = 0;
+
     if (av_codec_is_encoder(avctx->codec)) {
         int caps = avctx->codec->capabilities;
 

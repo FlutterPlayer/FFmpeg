@@ -20,6 +20,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "avassert.h"
@@ -181,6 +182,42 @@ int av_dict_set_int(AVDictionary **pm, const char *key, int64_t value,
     snprintf(valuestr, sizeof(valuestr), "%"PRId64, value);
     flags &= ~AV_DICT_DONT_STRDUP_VAL;
     return av_dict_set(pm, key, valuestr, flags);
+}
+
+int av_dict_set_intptr(AVDictionary **pm, const char *key, uintptr_t value,
+                int flags)
+{
+    char valuestr[22];
+    snprintf(valuestr, sizeof(valuestr), "%p", value);
+    flags &= ~AV_DICT_DONT_STRDUP_VAL;
+    return av_dict_set(pm, key, valuestr, flags);
+}
+
+uintptr_t av_dict_get_intptr(const AVDictionary *m, const char* key) {
+    AVDictionaryEntry *t = NULL;
+    if ((t = av_dict_get(m, key, NULL, 0))) {
+      return av_dict_strtoptr(t->value);
+    }
+    return (uintptr_t)NULL;
+}
+
+uintptr_t av_dict_strtoptr(char * value) {
+   uintptr_t ptr = (uintptr_t)NULL;
+   char *next = NULL;
+   if(!value || value[0] !='0' || (value[1]|0x20)!='x') {
+       return (uintptr_t)NULL;
+   }
+   ptr = strtoull(value, &next, 16);
+   if (next == value) {
+       return (uintptr_t)NULL;
+   }
+   return ptr;
+}
+
+char * av_dict_ptrtostr(uintptr_t value) {
+    char valuestr[22] = {0};
+    snprintf(valuestr, sizeof(valuestr), "%p", value);
+    return av_strdup(valuestr);
 }
 
 static int parse_key_value_pair(AVDictionary **pm, const char **buf,

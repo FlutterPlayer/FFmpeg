@@ -5,6 +5,7 @@ HEADERS = adler32.h                                                     \
           aes.h                                                         \
           aes_ctr.h                                                     \
           ambient_viewing_environment.h                                 \
+          application.h                                                 \
           attributes.h                                                  \
           audio_fifo.h                                                  \
           avassert.h                                                    \
@@ -30,6 +31,7 @@ HEADERS = adler32.h                                                     \
           dovi_meta.h                                                   \
           downmix_info.h                                                \
           encryption_info.h                                             \
+          dns_cache.h                                                   \
           error.h                                                       \
           eval.h                                                        \
           executor.h                                                    \
@@ -92,6 +94,7 @@ HEADERS = adler32.h                                                     \
           timecode.h                                                    \
           timestamp.h                                                   \
           tree.h                                                        \
+          thread.h                                                      \
           twofish.h                                                     \
           uuid.h                                                        \
           version.h                                                     \
@@ -113,6 +116,7 @@ OBJS = adler32.o                                                        \
        aes.o                                                            \
        aes_ctr.o                                                        \
        ambient_viewing_environment.o                                    \
+       application.o                                                    \
        audio_fifo.o                                                     \
        avstring.o                                                       \
        avsscanf.o                                                       \
@@ -131,6 +135,7 @@ OBJS = adler32.o                                                        \
        detection_bbox.o                                                 \
        dict.o                                                           \
        display.o                                                        \
+       dns_cache.o                                                      \
        dovi_meta.o                                                      \
        downmix_info.o                                                   \
        encryption_info.o                                                \

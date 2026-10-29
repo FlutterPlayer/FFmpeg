@@ -612,6 +612,14 @@ static int seek_frame_internal(AVFormatContext *s, int stream_index,
         if (stream_index < 0)
             return -1;
 
+        if (flags & AVSEEK_FLAG_SAP) {
+            if (ffifmt(s->iformat)->read_seek) {
+                ff_read_frame_flush(s);
+                return ffifmt(s->iformat)->read_seek(s, stream_index, timestamp, flags);
+            } else
+                return -1;
+        }
+
         st = s->streams[stream_index];
         /* timestamp for default must be expressed in AV_TIME_BASE units */
         timestamp = av_rescale(timestamp, st->time_base.den,

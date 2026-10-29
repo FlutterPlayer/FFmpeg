@@ -31,6 +31,7 @@
 #include "libavutil/version.h"
 
 #include "libavcodec/version_major.h"
+#include "libavcodec/codec_id.h"
 
 /**
  * @defgroup lavc_packet_side_data AVPacketSideData
@@ -250,6 +251,12 @@ enum AVPacketSideDataType {
      * The format is not part of ABI, use av_encryption_info_* methods to access.
      */
     AV_PKT_DATA_ENCRYPTION_INFO,
+
+    /**
+     * Private usage
+     * The format is not part of ABI, use AVDictionary type
+     */
+    AV_PKT_DATA_DICT,
 
     /**
      * Active Format Description data consisting of a single byte as specified
@@ -551,7 +558,11 @@ typedef struct AVPacket {
     int64_t dts;
     uint8_t *data;
     int   size;
+
+    int   stream_id;
+    int   serial;
     int   stream_index;
+    enum AVCodecID codec_id;
     /**
      * A combination of AV_PKT_FLAG values
      */
@@ -594,6 +605,9 @@ typedef struct AVPacket {
      * or muxers.
      */
     AVRational time_base;
+
+    int64_t current_sap;
+    int64_t next_sap;
 } AVPacket;
 
 #if FF_API_INIT_PACKET
@@ -624,6 +638,10 @@ typedef struct AVPacketList {
  * be discarded by the decoder.  I.e. Non-reference frames.
  */
 #define AV_PKT_FLAG_DISPOSABLE 0x0010
+
+#define AV_PKT_FLAG_NEW_SEG 0x8000 ///< The packet is the first packet from a source in concat
+
+#define AV_PKT_FLAG_SAP 0x4000
 
 enum AVSideDataParamChangeFlags {
     AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE    = 0x0004,

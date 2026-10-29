@@ -1879,6 +1879,8 @@ retry_duration:
             stream_type == FLV_STREAM_TYPE_DATA)
             pkt->flags |= AV_PKT_FLAG_KEY;
 
+        pkt->codec_id     = st->codecpar->codec_id;
+
         ret = ff_buffer_packet(s, pkt);
         if (ret < 0)
             return ret;
